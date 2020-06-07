@@ -16,6 +16,7 @@
 #import <DZNEmptyDataSet/UIScrollView+EmptyDataSet.h>
 #import <AVFoundation/AVFoundation.h>
 #import <QuickLook/QuickLook.h>
+#import <MobileCoreServices/MobileCoreServices.h>
 
 
 #define OPERATION_TOOLBAR_TAG                   999
@@ -154,37 +155,28 @@ static CGFloat const kCellBorderMargin = 1.0;
     
     @weakify(self);
     dispatch_group_t group = dispatch_group_create();
-    dispatch_queue_t queue = dispatch_queue_create("com.0daybug", DISPATCH_QUEUE_SERIAL); // 串行队列
+    dispatch_queue_t queue = dispatch_queue_create("com.0daybug.globalqueue", DISPATCH_QUEUE_CONCURRENT);
     __block NSMutableArray<XPPhotoModel *> *photos = [NSMutableArray array];
+    // 从系统中拷贝图片/视频到沙盒目录
     for (PHAsset *asset in assets) {
+        if (asset.mediaType == PHAssetMediaTypeUnknown || asset.mediaType == PHAssetMediaTypeAudio) continue;
         dispatch_group_enter(group);
         dispatch_group_async(group, queue, ^{
-            [[PHImageManager defaultManager] requestImageDataForAsset:asset options:nil resultHandler:^(NSData * _Nullable imageData, NSString * _Nullable dataUTI, UIImageOrientation orientation, NSDictionary * _Nullable info) {
-                @strongify(self);
-                if (nil == self || nil == imageData) return;
-                NSString *imageFileURL = info[@"PHImageFileURLKey"];
-                XPPhotoModel *photo = [[XPPhotoModel alloc] init];
-                photo.albumid = self.album.albumid;
-                photo.filename = [NSString stringWithFormat:@"%@.%@",generateUniquelyIdentifier(),imageFileURL.pathExtension];
-                photo.originalname = [imageFileURL lastPathComponent];
-                photo.createtime = [asset.creationDate timeIntervalSince1970];
-                photo.addtime = [[NSDate date] timeIntervalSince1970];
-                photo.filesize = imageData.length;
-                [photos addObject:photo];
-                // 将图片写入目标文件
-                NSString *path = [NSString stringWithFormat:@"%@/%@/%@", photoRootDirectory(),self.album.directory,photo.filename];
-                [imageData writeToFile:path atomically:YES];
-                
-                // 生成缩略图并保存
-                NSString *thumbPath = [NSString stringWithFormat:@"%@/%@/%@/%@", photoRootDirectory(),self.album.directory,XPThumbDirectoryNameKey,photo.filename];
-                UIImage *thumbImage = [UIImage thumbnailImageFromSourceImageData:imageData destinationSize:CGSizeMake(XPThumbImageWidthAndHeightKey, XPThumbImageWidthAndHeightKey)];
-                NSData *thumbData = UIImageJPEGRepresentation(thumbImage, 0.75);
-                [thumbData writeToFile:thumbPath atomically:YES];
-                
-                dispatch_group_leave(group);
-            }];
+            @strongify(self);
+            if (asset.mediaType == PHAssetMediaTypeVideo) { // 视频
+                [self fetchVideoForPHAsset:asset completionHandler:^(XPPhotoModel *photo) {
+                    [photos addObject:photo];
+                    dispatch_group_leave(group);
+                }];
+            } else if (asset.mediaType == PHAssetMediaTypeImage) { // 图片
+                [self fetchImageForPHAsset:asset completionHandler:^(XPPhotoModel *photo) {
+                    [photos addObject:photo];
+                    dispatch_group_leave(group);
+                }];
+            }
         });
     }
+    // 所有图片/视频已拷贝完毕
     dispatch_group_notify(group, queue, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
             @strongify(self);
@@ -243,16 +235,30 @@ static CGFloat const kCellBorderMargin = 1.0;
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
-    UIImage *image = info[UIImagePickerControllerOriginalImage];
-    NSData *data = UIImageJPEGRepresentation(image, 0.75);
-    NSString *filename = [NSString stringWithFormat:@"%@.JPG", generateUniquelyIdentifier()];
+    NSData *data = nil;
+    NSString *filename = nil;
+    UIImage *previewImage = nil;
+    XPFileType filetype = XPFileTypeImage;
+    NSString *mediaType = info[UIImagePickerControllerMediaType];
+    CGSize size = CGSizeMake(XPThumbImageWidthAndHeightKey, XPThumbImageWidthAndHeightKey);
+    if ([mediaType isEqualToString:(NSString*)kUTTypeMovie]) { // 视频
+        NSURL *mediaURL = info[UIImagePickerControllerMediaURL];
+        data = [NSData dataWithContentsOfURL:mediaURL];
+        filename = [NSString stringWithFormat:@"%@.%@", generateUniquelyIdentifier(),mediaURL.pathExtension];
+        previewImage = [UIImage snapshotImageWithVideoURL:mediaURL];
+        previewImage = [UIImage thumbnailImageFromSourceImage:previewImage destinationSize:size];
+        filetype = XPFileTypeVideo;
+    } else { // 拍照
+        UIImage *image = info[UIImagePickerControllerOriginalImage];
+        data = UIImageJPEGRepresentation(image, 0.75);
+        filename = [NSString stringWithFormat:@"%@.JPG", generateUniquelyIdentifier()];
+        previewImage = [UIImage thumbnailImageFromSourceImageData:data destinationSize:size];
+    }
     NSString *path = [NSString stringWithFormat:@"%@/%@/%@", photoRootDirectory(),self.album.directory,filename];
     BOOL isSuccess = [data writeToFile:path atomically:YES];
     if (isSuccess) {
-        // 生成缩略图并保存
         NSString *thumbPath = [NSString stringWithFormat:@"%@/%@/%@/%@", photoRootDirectory(),self.album.directory,XPThumbDirectoryNameKey,filename];
-        UIImage *thumbImage = [UIImage thumbnailImageFromSourceImageData:data destinationSize:CGSizeMake(XPThumbImageWidthAndHeightKey, XPThumbImageWidthAndHeightKey)];
-        NSData *thumbData = UIImageJPEGRepresentation(thumbImage, 0.75);
+        NSData *thumbData = UIImageJPEGRepresentation(previewImage, 0.75);
         [thumbData writeToFile:thumbPath atomically:YES];
         
         // 保存图片记录到数据库
@@ -262,6 +268,7 @@ static CGFloat const kCellBorderMargin = 1.0;
         photo.originalname = @"";
         photo.createtime = photo.addtime = [[NSDate date] timeIntervalSince1970];
         photo.filesize = data.length;
+        photo.filetype = filetype;
         [[XPSQLiteManager sharedSQLiteManager] addPhotos:@[photo]];
         self.album.count++;
         
@@ -355,6 +362,7 @@ static CGFloat const kCellBorderMargin = 1.0;
         
         UIImagePickerController *pickerVc = [[UIImagePickerController alloc] init];
         pickerVc.sourceType = UIImagePickerControllerSourceTypeCamera;
+        pickerVc.mediaTypes = @[(NSString*)kUTTypeImage, (NSString*)kUTTypeMovie];
         pickerVc.delegate = self;
         [self presentViewController:pickerVc animated:YES completion:nil];
     }]];
@@ -473,6 +481,8 @@ static CGFloat const kCellBorderMargin = 1.0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self.collectionView reloadData];
                 [XPProgressHUD hideHUDForView:[UIApplication sharedApplication].keyWindow];
+                [self.selectMaps removeAllObjects];
+                [self updateToolbarIndicator];
             });
         });
     }]];
@@ -485,6 +495,78 @@ static CGFloat const kCellBorderMargin = 1.0;
 }
 
 #pragma mark - Private
+
+/// 从系统中获取视频文件
+- (void)fetchVideoForPHAsset:(PHAsset *)asset completionHandler:(void(^)(XPPhotoModel *photo))completionHandler {
+    @weakify(self);
+    [[PHImageManager defaultManager] requestAVAssetForVideo:asset options:nil resultHandler:^(AVAsset * _Nullable asset, AVAudioMix * _Nullable audioMix, NSDictionary * _Nullable info) {
+        @strongify(self);
+        if (![asset isKindOfClass:[AVURLAsset class]]) return;
+        AVURLAsset *urlAsset = (AVURLAsset *)asset;
+        // 视频文件
+        NSString *suffix = [urlAsset.URL.absoluteString pathExtension];
+        NSString *filename = [NSString stringWithFormat:@"%@.%@", generateUniquelyIdentifier(),suffix];
+        NSData *videoData = [NSData dataWithContentsOfURL:urlAsset.URL];
+        NSString *path = [NSString stringWithFormat:@"%@/%@/%@", photoRootDirectory(),self.album.directory,filename];
+        [videoData writeToFile:path atomically:YES];
+        // 视频预览图
+        UIImage *thumbImage = [UIImage snapshotImageWithVideoURL:urlAsset.URL];
+        thumbImage = [UIImage thumbnailImageFromSourceImage:thumbImage destinationSize:CGSizeMake(XPThumbImageWidthAndHeightKey, XPThumbImageWidthAndHeightKey)];
+        NSString *thumbPath = [NSString stringWithFormat:@"%@/%@/%@/%@", photoRootDirectory(),self.album.directory,XPThumbDirectoryNameKey,filename];
+        NSData *thumbData = UIImageJPEGRepresentation(thumbImage, 0.75);
+        [thumbData writeToFile:thumbPath atomically:YES];
+        // 保存视频信息
+        XPPhotoModel *photo = [[XPPhotoModel alloc] init];
+        photo.albumid = self.album.albumid;
+        photo.filename = filename;
+        photo.originalname = [urlAsset.URL.absoluteString lastPathComponent];
+        photo.addtime = [[NSDate date] timeIntervalSince1970];
+        photo.filesize = videoData.length;
+        photo.filetype = XPFileTypeVideo;
+        
+        if (nil != completionHandler) {
+            completionHandler(photo);
+        }
+    }];
+}
+
+/// 从系统中获取图片文件
+- (void)fetchImageForPHAsset:(PHAsset *)asset completionHandler:(void(^)(XPPhotoModel *photo))completionHandler {
+    @weakify(self);
+    [[PHImageManager defaultManager] requestImageDataForAsset:asset options:nil resultHandler:^(NSData * _Nullable imageData, NSString * _Nullable dataUTI, UIImageOrientation orientation, NSDictionary * _Nullable info) {
+        @strongify(self);
+        NSURL *imageFileURL = info[@"PHImageFileURLKey"];
+        XPPhotoModel *photo = [[XPPhotoModel alloc] init];
+        photo.albumid = self.album.albumid;
+        photo.filename = [NSString stringWithFormat:@"%@.%@",generateUniquelyIdentifier(),imageFileURL.pathExtension];
+        photo.originalname = [imageFileURL lastPathComponent];
+        photo.createtime = [asset.creationDate timeIntervalSince1970];
+        photo.addtime = [[NSDate date] timeIntervalSince1970];
+        photo.filesize = imageData.length;
+        photo.filetype = [imageFileURL.pathExtension.uppercaseString isEqualToString:@"GIF"] ? XPFileTypeGIFImage : XPFileTypeImage;
+        
+        // 将图片写入目标文件
+        NSString *path = [NSString stringWithFormat:@"%@/%@/%@", photoRootDirectory(),self.album.directory,photo.filename];
+        [imageData writeToFile:path atomically:YES];
+        
+        // 生成缩略图并保存
+        NSString *thumbPath = [NSString stringWithFormat:@"%@/%@/%@/%@", photoRootDirectory(),self.album.directory,XPThumbDirectoryNameKey,photo.filename];
+        UIImage *thumbImage = nil;
+        CGSize thumbImageSize = CGSizeMake(XPThumbImageWidthAndHeightKey, XPThumbImageWidthAndHeightKey);
+        if (photo.filetype == XPFileTypeGIFImage) {
+            UIImage *tmpImage = [UIImage snapshotImageWithGIFImageURL:imageFileURL];
+            thumbImage = [UIImage thumbnailImageFromSourceImage:tmpImage destinationSize:thumbImageSize];
+        } else {
+            thumbImage = [UIImage thumbnailImageFromSourceImageData:imageData destinationSize:thumbImageSize];
+        }
+        NSData *thumbData = UIImageJPEGRepresentation(thumbImage, 0.75);
+        [thumbData writeToFile:thumbPath atomically:YES];
+        
+        if (nil != completionHandler) {
+            completionHandler(photo);
+        }
+    }];
+}
 
 /// 添加底部的操作条
 - (void)addOperationToolbar {
